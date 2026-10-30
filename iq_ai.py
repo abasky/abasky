@@ -139,9 +139,34 @@ def _load_modnet():
 
     try:
         options = ort.SessionOptions()
+
         options.graph_optimization_level = (
             ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         )
+
+        # ---------------------------------------------------------
+        # CPU performance tuning
+        # ---------------------------------------------------------
+
+        # لا نسمح للموديل باستهلاك جميع أنوية المعالج.
+        # نترك موارد لبقية البرنامج وعمليات OpenCV.
+        cpu_count = os.cpu_count() or 2
+
+        options.intra_op_num_threads = max(
+            1,
+            min(4, cpu_count),
+        )
+
+        # تنفيذ العمليات المتوازية بين العقد غير مطلوب هنا.
+        options.inter_op_num_threads = 1
+
+        # يقلل التنافس بين مجموعات خيوط ONNX.
+        options.execution_mode = (
+            ort.ExecutionMode.ORT_SEQUENTIAL
+        )
+
+        options.enable_cpu_mem_arena = True
+        options.enable_mem_pattern = True
 
         # CPU provider: يعمل دون الحاجة إلى CUDA.
         session = ort.InferenceSession(
@@ -309,7 +334,6 @@ def load():
         if not hasattr(cv2, "dnn"):
             return False, "نسخة OpenCV لا تدعم DNN."
 
-        # Each model is loaded independently.
         _load_modnet()
         _load_u2net()
         _load_yunet()
@@ -495,7 +519,6 @@ def _modnet_alpha(bgr, face=None):
         if mean_value < 0.005 or mean_value > 0.995:
             return None
 
-        # Gentle edge smoothing only.
         alpha = cv2.GaussianBlur(
             alpha,
             (0, 0),
@@ -634,7 +657,6 @@ def _u2_alpha(bgr, face=None):
         ),
     )
 
-    # Fill internal holes.
     inv = (1 - comp).astype(np.uint8) * 255
     ff = inv.copy()
 
