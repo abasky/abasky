@@ -672,17 +672,28 @@ class CardRow(QFrame):
 
 
 class PreviewLabel(QLabel):
+    swap_requested = Signal(object, object)   # (item_a, item_b) — عنصرا iq_core.Item المطلوب تبديل مواضعهما
+
     def __init__(self):
         super().__init__()
         self._pm = None
+        self.placements = []            # [(x, y, w, h, Item), ...] بالمليمتر — لصفحة المعاينة الحالية
+        self.paper_wh = (210.0, 297.0)  # أبعاد الورقة الحالية (مم)
+        self._drag_item = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.setMinimumSize(240, 320)
         self.setStyleSheet("background:#e4e9f0; border:1px solid #cfd6df; border-radius:8px;")
+        self.setToolTip("اسحب أي صورة هنا وأفلتها على مكان صورة أخرى لتبديل مواضعهما (الأحجام والترتيب العام لا يتغيران)")
 
     def set_source(self, pm):
         self._pm = pm
         self._rescale()
+
+    def set_layout(self, paper_w, paper_h, placements):
+        """يحفظ هندسة الصفحة الحالية (بالمليمتر) حتى يقدر السحب والإفلات يحدد الصورة تحت المؤشر."""
+        self.paper_wh = (float(paper_w), float(paper_h))
+        self.placements = placements
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -692,6 +703,43 @@ class PreviewLabel(QLabel):
         if self._pm is not None:
             self.setPixmap(self._pm.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
                                            Qt.TransformationMode.SmoothTransformation))
+
+    def _item_at(self, pos):
+        """يرجع عنصر iq_core.Item تحت نقطة pos (إحداثيات داخل هذا الودجت)، أو None."""
+        pm = self.pixmap()
+        if pm is None or pm.isNull() or not self.placements:
+            return None
+        ox = (self.width() - pm.width()) / 2.0
+        oy = (self.height() - pm.height()) / 2.0
+        px, py = pos.x() - ox, pos.y() - oy
+        if px < 0 or py < 0 or px >= pm.width() or py >= pm.height():
+            return None
+        pw_mm, ph_mm = self.paper_wh
+        if pm.width() <= 0 or pm.height() <= 0:
+            return None
+        mx = px / pm.width() * pw_mm
+        my = py / pm.height() * ph_mm
+        for x, y, w, h, it in self.placements:
+            if x <= mx <= x + w and y <= my <= y + h:
+                return it
+        return None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_item = self._item_at(_event_pos(e))
+            if self._drag_item is not None:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._drag_item is not None:
+            src = self._drag_item
+            self._drag_item = None
+            self.unsetCursor()
+            target = self._item_at(_event_pos(e))
+            if target is not None and target is not src:
+                self.swap_requested.emit(src, target)
+        super().mouseReleaseEvent(e)
 
 
 # ----------------------------------------------------------------------------
@@ -1265,6 +1313,7 @@ class MainWindow(QMainWindow):
         nl.addWidget(self.btn_next)
         pv.addWidget(nav)
         self.preview = PreviewLabel()
+        self.preview.swap_requested.connect(self._swap_preview_items)
         pv.addWidget(self.preview, 1)
         self.lbl_info = QLabel()
         self.lbl_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1981,6 +2030,37 @@ class MainWindow(QMainWindow):
         self.btn_prev.setEnabled(self.page_idx > 0)
         self.btn_next.setEnabled(self.page_idx < n - 1)
         self.preview.set_source(QPixmap.fromImage(pil_to_qimage(self.pages[self.page_idx])))
+        pw, ph, placements = self._current_placements()
+        self.preview.set_layout(pw, ph, placements)
+
+    def _current_placements(self):
+        """هندسة عناصر صفحة المعاينة الحالية (بالمليمتر) — بنفس حساب core.compose تماماً،
+        حتى تتطابق مواضع السحب والإفلات مع الصورة المعروضة فعلياً."""
+        o = core.merged_layout(self.layout_opts())
+        pw, ph = core.paper_size(o["paper"])
+        items = core.build_items(self.cards, o, include_empty=True)
+        pages = core.layout_pages(items, pw, ph, o)
+        if not pages:
+            return pw, ph, []
+        idx = min(self.page_idx, len(pages) - 1)
+        return pw, ph, pages[idx]
+
+    def _swap_preview_items(self, item_a, item_b):
+        """يبدّل محتوى صورتين (وجه/ظهر) ضمن المعاينة — بدون أي مساس بمقاس أي بطاقة أو ترتيب البطاقات نفسها."""
+        if item_a is item_b or item_a.card >= len(self.cards) or item_b.card >= len(self.cards):
+            return
+        side_a = self.cards[item_a.card].side(item_a.side)
+        side_b = self.cards[item_b.card].side(item_b.side)
+        (side_a.orig_bytes, side_a.state, side_a.result, side_a.uid,
+         side_b.orig_bytes, side_b.state, side_b.result, side_b.uid) = (
+         side_b.orig_bytes, side_b.state, side_b.result, side_b.uid,
+         side_a.orig_bytes, side_a.state, side_a.result, side_a.uid)
+        if item_a.card < len(self.rows):
+            self.rows[item_a.card].refresh()
+        if item_b.card < len(self.rows):
+            self.rows[item_b.card].refresh()
+        self.dirty = True
+        self.refresh_preview()
 
     def go_page(self, d):
         if not self.pages:
@@ -2324,3 +2404,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
