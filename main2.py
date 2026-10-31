@@ -347,8 +347,7 @@ class CropCanvas(QWidget):
         wd = max(abs(dx), abs(dy) * self.aspect, 24.0)
         max_w = (self.img_w - 1 - ox) if sx > 0 else ox
         max_h = (self.img_h - 1 - oy) if sy > 0 else oy
-        wd = min
-        (wd, max_w, max_h * self.aspect)
+        wd = min(wd, max_w, max_h * self.aspect)
         if wd < 8:
             return
         hd = wd / self.aspect
@@ -1447,7 +1446,8 @@ class MainWindow(QMainWindow):
         """يستعيد الذكاء الاصطناعي سابق التفعيل دون تعطيل واجهة البرنامج."""
         if self.prefs.get("ai", False):
             self._start_ai_loading(quiet=True)
-                def _style_changed(self, *_):
+
+    def _style_changed(self, *_):
         """إذا آخر بطاقة فارغة نبدّلها فوراً للمقاس المختار (حتى تنزل الصور الجديدة بالقالب الصحيح)."""
         if self._building or not self.rows or self.cards[-1].has_any():
             return
@@ -1813,7 +1813,8 @@ class MainWindow(QMainWindow):
         if not self.project_path:
             return self.save_project_as()
         return self._write_project(self.project_path)
-        def save_project_as(self):
+
+    def save_project_as(self):
         default = os.path.join(self.prefs.get("last_dir", ""), "IQ_%s%s" % (time.strftime("%Y%m%d_%H%M"), core.PROJECT_EXT))
         path, _f = QFileDialog.getSaveFileName(self, "حفظ المشروع", default, PROJECT_FILTER)
         if not path:
