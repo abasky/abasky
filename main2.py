@@ -740,8 +740,396 @@ class PreviewLabel(QLabel):
 #----------------------------------------------------------------------------
 # رسائل بأزرار عربية
 # ---------------------------------------------------------------------------
- h = self.canvas.img_w, self.canvas.img_h
-        self.canvas.quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)
+ 
+   def ask_buttons(parent, title, text, labels, icon="question"):
+    """يعرض رسالة بأزرار عربية. يرجع رقم الزر المضغوط (حسب ترتيب labels) أو -1."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Warning if icon == "warning" else QMessageBox.Icon.Question)
+    box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    btns = []
+    for i, lab in enumerate(labels):
+        role = QMessageBox.ButtonRole.AcceptRole if i == 0 else (
+            QMessageBox.ButtonRole.RejectRole if i == len(labels) - 1 else QMessageBox.ButtonRole.DestructiveRole)
+        btns.append(box.addButton(lab, role))
+    box.exec()
+    clicked = box.clickedButton()
+    for i, b in enumerate(btns):
+        if clicked is b:
+            return i
+    return -1
+
+
+def info_box(parent, title, text, warning=False):
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information)
+    box.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+    box.addButton("حسناً", QMessageBox.ButtonRole.AcceptRole)
+    box.exec()
+
+
+# ----------------------------------------------------------------------------
+# نافذة تحرير الصورة: قص + تدوير + ألوان وإضاءة
+# ----------------------------------------------------------------------------
+class CropDialog(QDialog):
+    ADJ_SLIDERS = (
+        ("brightness", "السطوع", -100, 100),
+        ("contrast", "التباين", -100, 100),
+        ("saturation", "التشبع", -100, 100),
+        ("warmth", "حرارة اللون", -100, 100),
+        ("sharpness", "الحدة", 0, 100),
+    )
+    ADJ_CHECKS = (
+        ("auto", "تحسين تلقائي"),
+        ("flatten", "معادلة الإضاءة (تخفيف الظلال)"),
+        ("bw", "أبيض وأسود"),
+    )
+
+    def __init__(self, orig_bgr, state, parent=None, score=None, aspect=None):
+        super().__init__(parent)
+        self.aspect = aspect
+        self.setWindowTitle("تحرير الصورة — قص وتدوير وألوان")
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.orig = orig_bgr
+        self.small = core.limit_size(orig_bgr, 2400)
+        self.st = core.normalize_state(state)
+        self.result_state = None
+        self.sliders = {}
+        self.checks = {}
+        self._loading = False
+        self._mode = "crop"
+        self._prev_shape = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._compute_preview)
+
+        root = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.canvas = CropCanvas()
+        self.canvas.picked.connect(self.on_picked)
+        left.addWidget(self.canvas, 1)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#44546a; padding:2px;")
+        left.addWidget(self.status)
+        root.addLayout(left, 1)
+
+        side = QVBoxLayout()
+        self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(340)
+        self.tabs.setMaximumWidth(400)
+        self.tabs.addTab(self._build_crop_tab(), "القص والتدوير")
+        self.tabs.addTab(self._build_color_tab(), "الألوان والإضاءة")
+        self.tabs.currentChanged.connect(self._on_tab)
+        side.addWidget(self.tabs, 1)
+
+        row = QHBoxLayout()
+        ok = QPushButton("اعتماد وتثبيت")
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept_result)
+        cancel = QPushButton("إلغاء")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(ok, 2)
+        row.addWidget(cancel, 1)
+        side.addLayout(row)
+        root.addLayout(side)
+
+        self.setMinimumSize(640, 460)
+        fit_window(self, 1180, 760, margin=60)
+
+        q = self.st["quad"]
+        self.quad_norm = [list(p) for p in q] if q is not None else self._inset_quad()
+        self._load_ui_from_state()
+        self._show_crop_view()
+
+        if self.aspect:
+            if score is not None and score <= 0:
+                self.status.setText("ما كدرت أتعرف على الوجه تلقائياً — حرّك الإطار أو كبّره من الزوايا (النسبة ثابتة) ثم اضغط «اعتماد وتثبيت».")
+            else:
+                self.status.setText("راجع الإطار: اسحب الزوايا للتكبير والتصغير، واسحب من الداخل للتحريك. زر «إزالة الخلفية» يضع خلفية بيضاء.")
+        elif q is None:
+            self.status.setText("ما كدرت أحدد الهوية تلقائياً — اضغط «حدد الهوية بالنقر» ثم انقر على الهوية، أو حرّك الزوايا يدوياً.")
+        elif score is not None and score < 0.08:
+            self.status.setText("الثقة بالحدود ضعيفة — راجعها، أو جرّب «حدد الهوية بالنقر».")
+        else:
+            self.status.setText("راجع الإطار الأخضر ثم اضغط «اعتماد وتثبيت». الضلع البرتقالي = أعلى البطاقة.")
+
+    # --- بناء التبويبات
+    def _build_crop_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel(
+            "اسحب الزوايا الأربع حول الهوية. عجلة الماوس للتقريب، "
+            "وضغطتين لملاءمة الصورة. الضلع البرتقالي هو أعلى البطاقة بالنتيجة."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#44546a;")
+        lay.addWidget(hint)
+
+        grid = QGridLayout()
+        if self.aspect:
+            items = (
+                ("تعرّف على الوجه وقص", self.smart_detect),
+                ("إزالة الخلفية (أبيض)", self.toggle_white),
+                ("ملاءمة الصورة", self.canvas_fit),
+                ("استعادة الأصل", self.reset_all),
+                ("تدوير ↺ 90°", lambda: self.rotate(-1)),
+                ("تدوير ↻ 90°", lambda: self.rotate(1)),
+            )
+        else:
+            items = (
+                ("تعرّف ذكي على الهوية", self.smart_detect),
+                ("حدد الهوية بالنقر", self.start_pick),
+                ("قص بدون (الصورة كاملة)", self.no_crop),
+                ("ملاءمة الصورة", self.canvas_fit),
+                ("تدوير ↺ 90°", lambda: self.rotate(-1)),
+                ("تدوير ↻ 90°", lambda: self.rotate(1)),
+                ("استعادة الأصل", self.reset_all),
+            )
+
+        for i, (txt, fn) in enumerate(items):
+            b = QPushButton(txt)
+            b.clicked.connect(lambda _=False, f=fn: f())
+            grid.addWidget(b, i // 2, i % 2)
+
+        lay.addLayout(grid)
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel("تضييق الحواف"))
+        self.trim_slider = QSlider(Qt.Orientation.Horizontal)
+        self.trim_slider.setRange(0, 80)
+        self.trim_slider.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.trim_slider.setToolTip("يقص من أطراف البطاقة قليلاً لإزالة حافة الخلفية")
+        self.trim_label = QLabel("0.0%")
+        self.trim_label.setMinimumWidth(42)
+        self.trim_slider.valueChanged.connect(self._trim_changed)
+        trow.addWidget(self.trim_slider, 1)
+        trow.addWidget(self.trim_label)
+        lay.addLayout(trow)
+        lay.addStretch(1)
+        return w
+
+    def _build_color_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel("حرّك المنزلقات وشوف النتيجة مباشرة. هذي التعديلات تنطبق على الصورة بعد القص.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#44546a;")
+        lay.addWidget(hint)
+
+        for key, text, lo, hi in self.ADJ_SLIDERS:
+            row = QHBoxLayout()
+            lbl = QLabel(text)
+            lbl.setMinimumWidth(78)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(lo, hi)
+            sl.setValue(0)
+            sl.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+            val = QLabel("0")
+            val.setMinimumWidth(32)
+            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sl.valueChanged.connect(
+                lambda v, k=key, vl=val: self._adj_slider_changed(k, v, vl)
+            )
+            row.addWidget(lbl)
+            row.addWidget(sl, 1)
+            row.addWidget(val)
+            lay.addLayout(row)
+            self.sliders[key] = (sl, val)
+
+        checks = self.ADJ_CHECKS
+        if self.aspect:
+            checks = (("whitebg", "خلفية بيضاء (إزالة الخلفية)"),) + tuple(checks)
+
+        for key, text in checks:
+            cb = QCheckBox(text)
+            cb.toggled.connect(
+                lambda checked, k=key: self._adj_check_changed(k, checked)
+            )
+            lay.addWidget(cb)
+            self.checks[key] = cb
+
+        self.chk_compare = QCheckBox("عرض الصورة قبل التعديل (للمقارنة)")
+        self.chk_compare.toggled.connect(lambda _c: self._compute_preview())
+        lay.addWidget(self.chk_compare)
+
+        reset = QPushButton("إعادة ضبط الألوان")
+        reset.clicked.connect(self.reset_colors)
+        lay.addWidget(reset)
+        lay.addStretch(1)
+        return w
+
+    # --- الحالة
+    def _eff_aspect(self):
+        return self.aspect if self.st["rot"] % 2 == 0 else 1.0 / self.aspect
+
+    def _inset_quad(self):
+        if self.aspect:
+            return core.default_photo_quad(
+                self.small.shape[1], self.small.shape[0], self._eff_aspect()
+            )
+        return [[0.08, 0.08], [0.92, 0.08], [0.92, 0.92], [0.08, 0.92]]
+
+    def _load_ui_from_state(self):
+        self._loading = True
+        adj = self.st["adj"]
+        for key, (sl, val) in self.sliders.items():
+            sl.setValue(int(adj.get(key, 0)))
+            val.setText(str(int(adj.get(key, 0))))
+        for key, cb in self.checks.items():
+            cb.setChecked(bool(adj.get(key, False)))
+        self.trim_slider.setValue(int(round(float(self.st["trim"]) * 10)))
+        self.trim_label.setText("%.1f%%" % float(self.st["trim"]))
+        self._loading = False
+
+    def _sync_quad_from_canvas(self):
+        if self._mode == "crop" and self.canvas.quad is not None and self.canvas.img_w > 1:
+            dims = np.array(
+                [max(self.canvas.img_w - 1, 1), max(self.canvas.img_h - 1, 1)],
+                np.float32
+            )
+            a = np.clip(np.asarray(self.canvas.quad, np.float32) / dims, 0.0, 1.0)
+            self.quad_norm = a.tolist()
+
+    def _state_now(self):
+        return {
+            "rot": self.st["rot"],
+            "quad": [list(p) for p in self.quad_norm],
+            "trim": float(self.st["trim"]),
+            "adj": dict(self.st["adj"])
+        }
+
+    # --- العرض
+    def _show_crop_view(self):
+        self._mode = "crop"
+        self.canvas.editable = True
+        self.canvas.set_image(self.small)
+        dims = np.array(
+            [self.canvas.img_w - 1, self.canvas.img_h - 1],
+            np.float32
+        )
+        self.canvas.quad = (
+            np.asarray(self.quad_norm, np.float32) * dims
+        ).astype(np.float32)
+        self.canvas.top_edge = (4 - self.st["rot"]) % 4
+        self.canvas.trim_pct = float(self.st["trim"])
+        self.canvas.aspect = self._eff_aspect() if self.aspect else None
+        self.canvas.update()
+
+    def _show_preview(self):
+        self._sync_quad_from_canvas()
+        self._mode = "preview"
+        self.canvas.editable = False
+        self._prev_shape = None
+        self._compute_preview()
+
+    def _compute_preview(self):
+        if self._mode != "preview":
+            return
+        st = self._state_now()
+        if self.chk_compare.isChecked():
+            st["adj"] = dict(core.DEFAULT_ADJ)
+        out = core.render_side(self.small, st, 1100)
+        changed = out.shape[:2] != self._prev_shape
+        self._prev_shape = out.shape[:2]
+        self.canvas.set_image(out, keep_view=not changed)
+
+    def _schedule_preview(self):
+        if self._mode == "preview":
+            self._timer.start(40)
+
+    def _on_tab(self, idx):
+        if idx == 1:
+            self._show_preview()
+            self.status.setText("هذي المعاينة بعد القص والتعديل.")
+        else:
+            self._sync_quad_from_canvas() if self._mode == "crop" else None
+            self._show_crop_view()
+            self.status.setText("اسحب الزوايا لضبط القص.")
+
+    # --- أوامر القص
+    def canvas_fit(self):
+        self.canvas.fit()
+
+    def _detect(self, seed=None):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return core.detect_card_quad_scored(self.small, seed)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def toggle_white(self):
+        cb = self.checks.get("whitebg")
+        if cb is None:
+            return
+        self._sync_quad_from_canvas()
+        cb.setChecked(not cb.isChecked())
+        self.tabs.setCurrentIndex(1)
+
+    def _detect_face(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            st, found = core.photo_state(self.small, self._eff_aspect())
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        dims = np.array(
+            [max(self.canvas.img_w - 1, 1), max(self.canvas.img_h - 1, 1)],
+            np.float32
+        )
+        self.canvas.quad = (
+            np.asarray(st["quad"], np.float32) * dims
+        ).astype(np.float32)
+        self.canvas.update()
+        self.status.setText(
+            "تم قص الوجه تلقائياً. راجع الإطار ثم اعتمد." if found
+            else "ما لقيت وجه — حرّك الإطار يدوياً."
+        )
+
+    def smart_detect(self):
+        if self.aspect:
+            self._detect_face()
+            return
+
+        q, score = self._detect()
+        if q is None:
+            self.status.setText(
+                "ما كدرت أتعرف على الهوية — جرّب «حدد الهوية بالنقر» أو حرّك الزوايا يدوياً."
+            )
+            return
+
+        self.canvas.quad = np.asarray(q, np.float32)
+        self.canvas.update()
+        self.status.setText(
+            "تم اقتراح الحدود. راجع الزوايا ثم اعتمد." if score >= 0.08
+            else "الثقة ضعيفة بالحدود — راجعها أو جرّب «حدد الهوية بالنقر»."
+        )
+
+    def start_pick(self):
+        self.canvas.begin_pick()
+        self.status.setText("انقر بالماوس على أي نقطة داخل الهوية...")
+
+    def on_picked(self, x, y):
+        q, score = self._detect((x, y))
+        if q is None:
+            self.status.setText(
+                "ما كدرت أحدد الهوية من هذي النقطة — جرّب نقطة ثانية أو حرّك الزوايا يدوياً."
+            )
+            return
+
+        self.canvas.quad = np.asarray(q, np.float32)
+        self.canvas.update()
+        self.status.setText("تم تحديد الهوية. راجع الزوايا ثم اعتمد.")
+
+    def no_crop(self):
+        w, h = self.canvas.img_w, self.canvas.img_h
+        self.canvas.quad = np.array(
+            [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+            np.float32
+        )
         self.canvas.update()
         self.status.setText("بدون قص — تُستعمل الصورة كاملة.")
 
@@ -2087,3 +2475,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
